@@ -3,12 +3,16 @@
 # GLM-5 Service Daemon
 # ============================================================================
 #
-# Auto-downloads the 1-bit quantized GLM-5 (744B MoE, 40B active) from
-# Unsloth and serves it via llama-server with an OpenAI-compatible API.
+# Auto-downloads GLM-5 (744B MoE, 40B active) from Unsloth and serves
+# it via llama-server with an OpenAI-compatible API.
 #
 # Architecture: glm_moe_dsa (256 experts, 8 active, DeepSeek Sparse Attention)
-# Quantization: Unsloth Dynamic 1-bit (TQ1_0) — 164GB on disk
-# Requirements: ~180GB RAM/VRAM combined, CUDA-capable GPU recommended
+# Default quant: Unsloth Dynamic 2-bit (IQ2_XXS) — 241GB, 6 shards
+# Alt quant:     Unsloth Dynamic 1-bit (TQ1_0) — 164GB (NOT RECOMMENDED: gibberish)
+# Requirements: ~250GB RAM/VRAM combined, CUDA-capable GPU recommended
+#
+# NOTE: TQ1_0 (1-bit) produces incoherent output (Chinese, repetition, garbage).
+# IQ2_XXS (2-bit) is the minimum viable quantization for this model.
 #
 # Usage:
 #   ./glm-service.sh                    # Download + serve (default port 8081)
@@ -41,7 +45,7 @@ PARALLEL="${GLM_PARALLEL:-2}"
 GPU_LAYERS="${GLM_GPU_LAYERS:-99}"
 TENSOR_SPLIT="${GLM_TENSOR_SPLIT:-80,80,80,0}"  # 3x A100 + skip GT1030
 LLAMA_CPP_DIR="${LLAMA_CPP_DIR:-/media/roko/sdb1/llama.cpp}"
-MODEL_FILE="GLM-5-UD-TQ1_0.gguf"
+QUANT="${GLM_QUANT:-iq2}"  # iq2 (default, recommended) or tq1 (not recommended)
 HF_REPO="unsloth/GLM-5-GGUF"
 DOWNLOAD_ONLY=false
 INSTALL_DAEMON=false
@@ -56,17 +60,42 @@ while [[ $# -gt 0 ]]; do
         --parallel) PARALLEL="$2"; shift 2 ;;
         --gpu-layers) GPU_LAYERS="$2"; shift 2 ;;
         --tensor-split) TENSOR_SPLIT="$2"; shift 2 ;;
+        --quant) QUANT="$2"; shift 2 ;;
         --download-only) DOWNLOAD_ONLY=true; shift ;;
         --install-daemon) INSTALL_DAEMON=true; shift ;;
         --help|-h)
-            head -35 "$0" | tail -30
+            head -40 "$0" | tail -35
             exit 0
             ;;
         *) echo "Unknown option: $1"; exit 1 ;;
     esac
 done
 
-MODEL_PATH="${STORAGE}/${MODEL_FILE}"
+# ── Resolve model file from quant selection ──
+case "${QUANT}" in
+    iq2|IQ2|2bit)
+        MODEL_SUBDIR="UD-IQ2_XXS"
+        MODEL_FILE="GLM-5-UD-IQ2_XXS-00001-of-00006.gguf"
+        HF_PATTERN="UD-IQ2_XXS/*"
+        MODEL_SIZE="241GB (6 shards)"
+        ;;
+    tq1|TQ1|1bit)
+        MODEL_SUBDIR=""
+        MODEL_FILE="GLM-5-UD-TQ1_0.gguf"
+        HF_PATTERN="GLM-5-UD-TQ1_0*"
+        MODEL_SIZE="164GB"
+        warn "TQ1_0 (1-bit) produces incoherent output. Use --quant iq2 instead."
+        ;;
+    *)
+        echo "Unknown quant: ${QUANT}. Use: iq2 (recommended) or tq1"; exit 1
+        ;;
+esac
+
+if [[ -n "${MODEL_SUBDIR}" ]]; then
+    MODEL_PATH="${STORAGE}/${MODEL_SUBDIR}/${MODEL_FILE}"
+else
+    MODEL_PATH="${STORAGE}/${MODEL_FILE}"
+fi
 
 # ── Colors ──
 RED='\033[0;31m'
@@ -90,8 +119,8 @@ mkdir -p "${STORAGE}" 2>/dev/null || {
 # ── Step 2: Download model if not present ──
 if [[ ! -f "${MODEL_PATH}" ]]; then
     log "Model not found at ${MODEL_PATH}"
-    log "Downloading GLM-5 1-bit (164GB) from Hugging Face..."
-    log "Repo: ${HF_REPO} / ${MODEL_FILE}"
+    log "Downloading GLM-5 ${QUANT} (${MODEL_SIZE}) from Hugging Face..."
+    log "Repo: ${HF_REPO} | Pattern: ${HF_PATTERN}"
 
     # Check for huggingface_hub
     if ! python3 -c "import huggingface_hub" 2>/dev/null; then
@@ -105,24 +134,22 @@ if [[ ! -f "${MODEL_PATH}" ]]; then
     fi
 
     python3 -c "
-from huggingface_hub import hf_hub_download
-import time, os
+from huggingface_hub import snapshot_download
+import time
 
-print(f'Downloading ${MODEL_FILE} to ${STORAGE}/', flush=True)
+print('Downloading GLM-5 model shards...', flush=True)
 print(f'Started: {time.strftime(\"%Y-%m-%d %H:%M:%S\")}', flush=True)
 start = time.time()
 
-path = hf_hub_download(
+path = snapshot_download(
     repo_id='${HF_REPO}',
-    filename='${MODEL_FILE}',
+    allow_patterns='${HF_PATTERN}',
     local_dir='${STORAGE}',
 )
 
 elapsed = time.time() - start
-size_gb = os.path.getsize(path) / (1024**3)
-rate = size_gb / (elapsed / 60)
 print(f'Complete: {path}', flush=True)
-print(f'Size: {size_gb:.1f} GB in {elapsed/60:.1f} minutes ({rate:.1f} GB/min)', flush=True)
+print(f'Duration: {elapsed/60:.1f} minutes', flush=True)
 "
 
     if [[ ! -f "${MODEL_PATH}" ]]; then
