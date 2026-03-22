@@ -232,7 +232,7 @@ exec "${LLAMA_SERVER}" \
     --n-gpu-layers "${GPU_LAYERS}" \
     --ctx-size "${CTX_SIZE}" \
     --parallel "${PARALLEL}" \
-    --flash-attn \
+    --flash-attn on \
     --split-mode layer \
     --tensor-split "${TENSOR_SPLIT}" \
     --chat-template glm4
